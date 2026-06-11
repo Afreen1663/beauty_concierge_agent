@@ -1,127 +1,216 @@
+"""
+availability.py — Slot availability queries against Supabase.
+All date handling uses Dubai local time (UTC+4), converted to UTC for DB queries.
+"""
+
 from datetime import datetime, timedelta, timezone
 from api.database import supabase
 
+# Dubai is UTC+4
+DUBAI_TZ = timezone(timedelta(hours=4))
 
-def check_availability(service_id: str, branch_id: str = None, date_str: str = None) -> dict:
-    """
-    Queries available slots for a service, optionally filtered by branch and date.
-    Returns up to 5 available slots.
-    """
+_WEEKDAY_MAP = {
+    "monday": 0, "tuesday": 1, "wednesday": 2,
+    "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6,
+}
 
+
+def _parse_date(date_str: str) -> datetime | None:
+    """
+    Resolves a natural-language or explicit date string.
+    Returns a timezone-aware datetime in Dubai time (UTC+4).
+    Handles: today, tomorrow, day names, "this/next X", ordinals like "6th July".
+    """
+    today = datetime.now(DUBAI_TZ)
+    lower = date_str.lower().strip()
+
+    # Strip common prefixes: "this saturday", "next friday", "on monday"
+    for prefix in ("this ", "next ", "on ", "for "):
+        if lower.startswith(prefix):
+            lower = lower[len(prefix):]
+            break
+
+    # Remove ordinal suffixes: "6th" -> "6", "21st" -> "21"
+    lower = __import__("re").sub(r"(\d+)(st|nd|rd|th)\b", r"\1", lower)
+
+    if lower == "today":
+        return today.replace(hour=0, minute=0, second=0, microsecond=0)
+    if lower == "tomorrow":
+        return (today + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Day name matching
+    for day_name, weekday in _WEEKDAY_MAP.items():
+        if lower == day_name or lower.startswith(day_name):
+            days_ahead = (weekday - today.weekday()) % 7
+            if days_ahead == 0:
+                days_ahead = 7
+            target = today + timedelta(days=days_ahead)
+            return target.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Try explicit formats — also try stripped version without ordinals
+    for fmt in (
+        "%d %B",    # "6 July"
+        "%B %d",    # "July 6"
+        "%d %b",    # "6 Jul"
+        "%b %d",    # "Jul 6"
+        "%d/%m",    # "06/07"
+        "%Y-%m-%d", # "2026-07-06"
+        "%d-%m-%Y", # "06-07-2026"
+    ):
+        for candidate in (lower.strip(), date_str.strip()):
+            try:
+                parsed = datetime.strptime(candidate, fmt)
+                # Assign current year if not in format
+                if parsed.year == 1900:
+                    parsed = parsed.replace(year=today.year)
+                # If the date has already passed this year, assume next year
+                parsed = parsed.replace(tzinfo=DUBAI_TZ, hour=0, minute=0, second=0, microsecond=0)
+                if parsed.date() < today.date():
+                    parsed = parsed.replace(year=today.year + 1)
+                return parsed
+            except ValueError:
+                continue
+
+    return None
+
+
+def check_availability(
+    service_id: str,
+    branch_id: str = None,
+    date_str: str = None,
+    artist_id: str = None,
+    limit: int = 5,
+) -> dict:
     try:
-        query = supabase.table("time_slots").select(
-            "id, start_time, end_time, branch_id, artist_id, "
-            "branches(name), artists(name)"
-        ).eq("service_id", service_id).eq("status", "available")
+        query = (
+            supabase.table("time_slots")
+            .select("id, start_time, end_time, branch_id, artist_id, branches(id, name), artists(name)")
+            .eq("service_id", service_id)
+            .eq("status", "available")
+        )
 
         if branch_id:
             query = query.eq("branch_id", branch_id)
+        if artist_id:
+            query = query.eq("artist_id", artist_id)
 
-        # Date filtering
+        requested_date_label = date_str or "that date"
+
         if date_str:
-            # Parse relative dates
-            today = datetime.now(timezone.utc)
-            date_lower = date_str.lower().strip()
-
-            if date_lower == "tomorrow":
-                target = today + timedelta(days=1)
-            elif date_lower == "today":
-                target = today
-            elif date_lower in ["saturday", "saturday"]:
-                days_ahead = (5 - today.weekday()) % 7
-                target = today + timedelta(days=days_ahead if days_ahead > 0 else 7)
-            elif date_lower == "sunday":
-                days_ahead = (6 - today.weekday()) % 7
-                target = today + timedelta(days=days_ahead if days_ahead > 0 else 7)
-            elif date_lower == "monday":
-                days_ahead = (0 - today.weekday()) % 7
-                target = today + timedelta(days=days_ahead if days_ahead > 0 else 7)
-            elif date_lower == "tuesday":
-                days_ahead = (1 - today.weekday()) % 7
-                target = today + timedelta(days=days_ahead if days_ahead > 0 else 7)
-            elif date_lower == "wednesday":
-                days_ahead = (2 - today.weekday()) % 7
-                target = today + timedelta(days=days_ahead if days_ahead > 0 else 7)
-            elif date_lower == "thursday":
-                days_ahead = (3 - today.weekday()) % 7
-                target = today + timedelta(days=days_ahead if days_ahead > 0 else 7)
-            elif date_lower == "friday":
-                days_ahead = (4 - today.weekday()) % 7
-                target = today + timedelta(days=days_ahead if days_ahead > 0 else 7)
-            else:
-                # Try parsing as a real date e.g. "5 July", "July 5"
-                try:
-                    target = datetime.strptime(date_str, "%d %B").replace(
-                        year=datetime.now().year, tzinfo=timezone.utc
-                    )
-                except ValueError:
-                    try:
-                        target = datetime.strptime(date_str, "%B %d").replace(
-                            year=datetime.now().year, tzinfo=timezone.utc
-                        )
-                    except ValueError:
-                        target = None
-
+            target = _parse_date(date_str)
             if target:
-                day_start = target.replace(hour=0, minute=0, second=0, microsecond=0)
-                day_end = target.replace(hour=23, minute=59, second=59, microsecond=0)
-                query = query.gte("start_time", day_start.isoformat())
-                query = query.lte("start_time", day_end.isoformat())
+                # Build day window in Dubai time, then convert to UTC for Supabase
+                day_start_dubai = target.replace(hour=0, minute=0, second=0, microsecond=0)
+                day_end_dubai   = target.replace(hour=23, minute=59, second=59, microsecond=0)
 
-        result = query.order("start_time").limit(5).execute()
-        slots = result.data
+                day_start_utc = day_start_dubai.astimezone(timezone.utc)
+                day_end_utc   = day_end_dubai.astimezone(timezone.utc)
+
+                query = (
+                    query
+                    .gte("start_time", day_start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"))
+                    .lte("start_time", day_end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"))
+                )
+            else:
+                # date_str was provided but couldn't be parsed — fall through to future slots
+                print(f"[AVAILABILITY] Could not parse date_str: '{date_str}'")
+                now_dubai = datetime.now(DUBAI_TZ)
+                query = query.gte("start_time", now_dubai.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        else:
+            now_dubai = datetime.now(DUBAI_TZ)
+            query = query.gte("start_time", now_dubai.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+        result = query.order("start_time").limit(limit).execute()
+        slots = result.data or []
 
         if not slots:
-            # Try fetching next 3 available slots on any date as alternatives
-            fallback = supabase.table("time_slots").select(
-                "id, start_time, end_time, branch_id, artist_id, "
-                "branches(name), artists(name)"
-            ).eq("service_id", service_id).eq("status", "available") \
-             .gte("start_time", datetime.now(timezone.utc).isoformat()) \
-             .order("start_time").limit(3).execute()
+            # Fallback — next 5 available slots on any future date
+            now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            fallback_query = (
+                supabase.table("time_slots")
+                .select("id, start_time, end_time, branch_id, artist_id, branches(id, name), artists(name)")
+                .eq("service_id", service_id)
+                .eq("status", "available")
+                .gte("start_time", now_utc)
+                .order("start_time")
+                .limit(5)
+            )
+            if branch_id:
+                fallback_query = fallback_query.eq("branch_id", branch_id)
+
+            fallback_result = fallback_query.execute()
+            alternatives = fallback_result.data or []
 
             return {
                 "status": "NO_AVAILABILITY",
                 "slots": [],
-                "alternatives": fallback.data,
-                "message": "No slots available for that date."
+                "alternatives": alternatives,
+                "message": (
+                    f"No slots available on {requested_date_label}."
+                    + (" Here are the next available times:" if alternatives else " No upcoming slots found.")
+                ),
             }
 
         return {
             "status": "AVAILABLE",
             "slots": slots,
-            "message": f"Found {len(slots)} available slot(s)."
+            "alternatives": [],
+            "message": f"Found {len(slots)} available slot(s).",
         }
 
     except Exception as e:
-        return {"status": "ERROR", "message": str(e), "slots": []}
+        print(f"[AVAILABILITY] check_availability error: {e}")
+        return {
+            "status": "ERROR",
+            "message": str(e),
+            "slots": [],
+            "alternatives": [],
+        }
 
 
 def resolve_service_id(service_name: str) -> str | None:
-    """
-    Looks up a service ID by name (case-insensitive partial match).
-    """
     try:
-        result = supabase.table("services").select("id, name") \
-            .ilike("name", f"%{service_name}%") \
-            .limit(1).execute()
+        result = (
+            supabase.table("services")
+            .select("id, name")
+            .ilike("name", f"%{service_name}%")
+            .limit(1)
+            .execute()
+        )
         if result.data:
             return result.data[0]["id"]
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[AVAILABILITY] resolve_service_id error: {e}")
     return None
 
 
 def resolve_branch_id(branch_name: str) -> str | None:
-    """
-    Looks up a branch ID by name.
-    """
     try:
-        result = supabase.table("branches").select("id, name") \
-            .ilike("name", f"%{branch_name}%") \
-            .limit(1).execute()
+        result = (
+            supabase.table("branches")
+            .select("id, name")
+            .ilike("name", f"%{branch_name}%")
+            .limit(1)
+            .execute()
+        )
         if result.data:
             return result.data[0]["id"]
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[AVAILABILITY] resolve_branch_id error: {e}")
+    return None
+
+
+def resolve_artist_id(artist_name: str) -> str | None:
+    try:
+        result = (
+            supabase.table("artists")
+            .select("id, name")
+            .ilike("name", f"%{artist_name}%")
+            .limit(1)
+            .execute()
+        )
+        if result.data:
+            return result.data[0]["id"]
+    except Exception as e:
+        print(f"[AVAILABILITY] resolve_artist_id error: {e}")
     return None

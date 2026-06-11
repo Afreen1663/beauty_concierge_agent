@@ -8,6 +8,9 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in .env")
+    raise ValueError(
+        "SUPABASE_URL and SUPABASE_KEY must be set in .env. "
+        "Please copy .env.example to .env and fill in your credentials."
+    )
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
