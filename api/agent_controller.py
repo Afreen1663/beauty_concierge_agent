@@ -1,5 +1,4 @@
-"""
-agent_controller.py — Core orchestration layer for Luma booking concierge.
+"""agent_controller.py — Core orchestration layer for Luma booking concierge.
 
 Conversation stage machine:
   collect_name                      — awaiting visitor full name
@@ -14,12 +13,13 @@ Conversation stage machine:
   collect_contact_for_booking       — mid-flow contact collection (regular booking)
   collect_name_for_consultation     — mid-flow name collection (consultation booking)
   collect_contact_for_consultation  — mid-flow contact collection (consultation)
-  awaiting_screening_switch_confirm — user asked for different service mid-screening
+  awaiting_screening_switch_confirm — user pivoted to different topic mid-screening
   collect_contact_post_screening    — gathering contact after screening submission
 """
 
 import os
 import re
+import json
 from openai import OpenAI
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
@@ -83,22 +83,61 @@ def _looks_like_name(text: str) -> bool:
     return alpha_ratio > 0.85
 
 
+def _interpret_yes_no(text: str) -> str:
+    """
+    Uses GPT-4o to intelligently interpret yes/no intent from natural language.
+    Returns 'yes', 'no', or 'unclear'.
+    """
+    text = text.strip()
+    if not text:
+        return "unclear"
+    try:
+        resp = _openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are interpreting whether a person's response means YES, NO, or is UNCLEAR. "
+                        "Consider colloquial expressions, hedging, and indirect answers. "
+                        "Examples: 'i dont think so' = NO, 'not really' = NO, 'absolutely' = YES, "
+                        "'sounds good' = YES, 'maybe' = UNCLEAR, 'what do you mean' = UNCLEAR. "
+                        "Respond with exactly one word: YES, NO, or UNCLEAR. Nothing else."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"The person said: \"{text}\"\n\nDoes this mean YES, NO, or UNCLEAR?"
+                }
+            ],
+            temperature=0,
+            max_tokens=5,
+        )
+        result = resp.choices[0].message.content.strip().upper()
+        if result == "YES":
+            return "yes"
+        if result == "NO":
+            return "no"
+        return "unclear"
+    except Exception:
+        # Fallback to keyword matching
+        t = text.lower()
+        if any(w in t for w in ["yes", "yeah", "yep", "sure", "ok", "okay", "confirm",
+                                  "go ahead", "book it", "absolutely", "perfect", "alright",
+                                  "of course", "definitely", "sounds good"]):
+            return "yes"
+        if any(w in t for w in ["no", "nope", "nah", "cancel", "stop", "dont",
+                                  "don't", "never mind", "nevermind", "not really"]):
+            return "no"
+        return "unclear"
+
+
 def _is_yes(text: str) -> bool:
-    t = text.lower().strip()
-    return any(w in t for w in [
-        "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "please",
-        "go ahead", "book it", "confirm", "correct", "absolutely",
-        "definitely", "do it", "sounds good", "great", "let's go",
-        "lets go", "perfect", "alright", "all right", "of course",
-    ])
+    return _interpret_yes_no(text) == "yes"
 
 
 def _is_no(text: str) -> bool:
-    t = text.lower().strip()
-    return any(w in t for w in [
-        "no", "nope", "nah", "cancel", "stop", "don't",
-        "dont", "never mind", "nevermind", "not now", "skip",
-    ])
+    return _interpret_yes_no(text) == "no"
 
 
 def _parse_slot_choice(text: str, slot_count: int):
@@ -175,6 +214,53 @@ def _save_visitor(name: str, contact: str) -> None:
         ).execute()
     except Exception as e:
         print(f"[VISITOR SAVE] Non-fatal: {e}")
+
+
+def _detect_pivot(user_message: str, current_question: str, service_name: str) -> dict:
+    """
+    Uses GPT-4o to detect whether the user has pivoted away from a screening question.
+    Returns {"is_pivot": bool, "pivot_topic": str or None}
+    """
+    try:
+        resp = _openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are helping a beauty salon booking assistant detect "
+                        "when a user has changed topic mid-conversation.\n\n"
+                        f"The user is currently answering medical screening questions "
+                        f"for a treatment called '{service_name}'. "
+                        f"The current question was: '{current_question}'\n\n"
+                        "Determine if the user's message is:\n"
+                        "A) A direct answer or response to the screening question "
+                        "(yes/no/clarification about the question/asking what a term means)\n"
+                        "B) A pivot to a completely different topic "
+                        "(asking about a different service, asking about hours/prices/location, "
+                        "asking an unrelated question, making a new booking request)\n\n"
+                        "If B, identify the topic in 3-5 words.\n\n"
+                        "Respond in JSON only, no markdown:\n"
+                        "{\"is_pivot\": true/false, \"pivot_topic\": \"topic or null\"}"
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"User said: \"{user_message}\""
+                }
+            ],
+            temperature=0,
+            max_tokens=60,
+        )
+        raw = resp.choices[0].message.content.strip()
+        parsed = json.loads(raw)
+        return {
+            "is_pivot": bool(parsed.get("is_pivot", False)),
+            "pivot_topic": parsed.get("pivot_topic"),
+        }
+    except Exception as e:
+        print(f"[PIVOT DETECT] Error: {e}")
+        return {"is_pivot": False, "pivot_topic": None}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,40 +409,74 @@ def handle_message(session_id: str, user_message: str) -> str:
 
         if current_q:
             q_num = get_question_number(current_q["id"])
+            current_svc_name = session.get("last_service_name", "your treatment")
 
-            # ── Detect if user wants to switch to a different service ─────────
-            possible_service_id = resolve_service_id(user_message)
-            if possible_service_id and possible_service_id != session.get("screening_service_id"):
-                try:
-                    current_svc = supabase.table("services").select("name").eq(
-                        "id", session["screening_service_id"]
-                    ).single().execute().data
-                    new_svc = supabase.table("services").select("name").eq(
-                        "id", possible_service_id
-                    ).single().execute().data
-                    current_svc_name = current_svc["name"]
-                    new_svc_name = new_svc["name"]
-                except Exception:
-                    current_svc_name = session.get("last_service_name", "current treatment")
-                    new_svc_name = "the new treatment"
+            # ── Step 1: Check if it's a plain yes/no first (cheapest check) ──
+            plain_answer = parse_yes_no(user_message)
 
+            if plain_answer is not None:
+                # It's a yes/no — record the answer and move on
+                answers[current_q["id"]] = plain_answer
+                update_session(session_id, {"screening_answers": answers})
+
+                next_q = get_next_question(answers)
+                if next_q:
+                    next_q_num = get_question_number(next_q["id"])
+                    response = (
+                        f"Question {next_q_num} of {len(SCREENING_QUESTIONS)}: "
+                        f"{next_q['question']}"
+                    )
+                    add_turn(session_id, user_message, response)
+                    return response
+
+                # All 6 answered — submit
+                result = submit_screening(
+                    service_id=session["screening_service_id"],
+                    service_category=session["screening_service_category"],
+                    answers=answers,
+                    client_id=session.get("client_id"),
+                    visitor_name=session.get("visitor_name"),
+                    visitor_contact=session.get("visitor_contact"),
+                )
+                clear_screening(session_id)
+                update_session(session_id, {"stage": "ready"})
+                response = result["message"]
+                if not session.get("visitor_contact") and not session.get("client_id"):
+                    response += (
+                        "\n\nCould I also take your phone number or email? "
+                        "We'll send you updates on your screening review."
+                    )
+                    update_session(session_id, {"stage": "collect_contact_post_screening"})
+                add_turn(session_id, user_message, response)
+                return response
+
+            # ── Step 2: Not yes/no — detect if pivot or clarification ─────────
+            pivot = _detect_pivot(user_message, current_q["question"], current_svc_name)
+
+            if pivot["is_pivot"] and pivot["pivot_topic"]:
+                # User has changed topic — pause screening and handle it
+                new_svc_id = resolve_service_id(user_message)
                 update_session(session_id, {
-                    "pending_new_service_id": possible_service_id,
-                    "pending_new_service_name": new_svc_name,
+                    "pending_new_service_id": new_svc_id,
+                    "pending_new_service_name": pivot["pivot_topic"],
+                    "pending_pivot_message": user_message,
                     "stage": "awaiting_screening_switch_confirm",
                 })
                 context = (
-                    f"The user is mid-way through a medical health screening for {current_svc_name} "
-                    f"(question {q_num} of {len(SCREENING_QUESTIONS)}), "
-                    f"but they just asked about {new_svc_name} instead. "
-                    f"Ask them warmly whether they want to stop the {current_svc_name} screening "
-                    f"and switch to {new_svc_name}, or continue with the {current_svc_name} screening."
+                    f"The user is mid-way through a medical health screening for "
+                    f"{current_svc_name} (question {q_num} of {len(SCREENING_QUESTIONS)}). "
+                    f"They just pivoted to ask about: '{pivot['pivot_topic']}'. "
+                    f"Their exact message was: '{user_message}'. "
+                    f"Respond warmly and naturally — acknowledge what they asked about, "
+                    f"then gently check whether they'd like to pause the {current_svc_name} "
+                    f"screening and come back to it, or continue with the screening now. "
+                    f"Don't be robotic — make it feel like a natural conversation."
                 )
                 response = _generate_response(context, user_message, history)
                 add_turn(session_id, user_message, response)
                 return response
 
-            # ── User says treatment is for someone else ───────────────────────
+            # ── Step 3: Not a pivot — must be clarification or unclear answer ─
             if is_for_someone_else(user_message):
                 update_session(session_id, {"screening_for": user_message.strip()})
                 context = (
@@ -370,7 +490,6 @@ def handle_message(session_id: str, user_message: str) -> str:
                 add_turn(session_id, user_message, response)
                 return response
 
-            # ── User is asking for clarification ─────────────────────────────
             if is_clarification_question(user_message):
                 context = (
                     f"The user is asking for clarification during a medical screening. "
@@ -384,73 +503,45 @@ def handle_message(session_id: str, user_message: str) -> str:
                 add_turn(session_id, user_message, response)
                 return response
 
-            # ── Standard yes/no answer ────────────────────────────────────────
-            parsed = parse_yes_no(user_message)
-            if parsed is None:
-                context = (
-                    f"The user's response '{user_message}' is unclear — not a clear yes or no. "
-                    f"Gently ask them again: "
-                    f"Question {q_num} of {len(SCREENING_QUESTIONS)}: {current_q['question']}"
-                )
-                response = _generate_response(context, user_message, history)
-                add_turn(session_id, user_message, response)
-                return response
-
-            answers[current_q["id"]] = parsed
-            update_session(session_id, {"screening_answers": answers})
-
-            next_q = get_next_question(answers)
-            if next_q:
-                next_q_num = get_question_number(next_q["id"])
-                response = (
-                    f"Question {next_q_num} of {len(SCREENING_QUESTIONS)}: "
-                    f"{next_q['question']}"
-                )
-                add_turn(session_id, user_message, response)
-                return response
-
-            # ── All 6 answered — submit ───────────────────────────────────────
-            result = submit_screening(
-                service_id=session["screening_service_id"],
-                service_category=session["screening_service_category"],
-                answers=answers,
-                client_id=session.get("client_id"),
-                visitor_name=session.get("visitor_name"),
-                visitor_contact=session.get("visitor_contact"),
+            # Genuinely unclear — ask again
+            context = (
+                f"The user's response '{user_message}' is unclear — not a clear yes or no, "
+                f"and not a topic change. Gently ask them to answer the screening question: "
+                f"Question {q_num} of {len(SCREENING_QUESTIONS)}: {current_q['question']}"
             )
-            clear_screening(session_id)
-            update_session(session_id, {"stage": "ready"})
-            response = result["message"]
-            if not session.get("visitor_contact") and not session.get("client_id"):
-                response += (
-                    "\n\nCould I also take your phone number or email? "
-                    "We'll send you updates on your screening review."
-                )
-                update_session(session_id, {"stage": "collect_contact_post_screening"})
+            response = _generate_response(context, user_message, history)
             add_turn(session_id, user_message, response)
             return response
 
     # ─────────────────────────────────────────────────────────────────────────
-    # STAGE: USER WANTS TO SWITCH SERVICE MID-SCREENING
+    # STAGE: USER PIVOTED MID-SCREENING — awaiting their decision
     # ─────────────────────────────────────────────────────────────────────────
     if stage == "awaiting_screening_switch_confirm":
+        new_service_name = session.get("pending_new_service_name", "the new topic")
         new_service_id = session.get("pending_new_service_id")
-        new_service_name = session.get("pending_new_service_name", "the new treatment")
         current_svc_name = session.get("last_service_name", "current treatment")
+        original_pivot_message = session.get("pending_pivot_message", user_message)
 
-        if _is_yes(user_message):
-            clear_screening(session_id)
+        yn = _interpret_yes_no(user_message)
+
+        if yn == "yes":
+            # Pause screening (preserve state), handle their other topic
             update_session(session_id, {
                 "pending_new_service_id": None,
                 "pending_new_service_name": None,
+                "pending_pivot_message": None,
                 "stage": "ready",
+                # screening_service_id and screening_answers intentionally preserved
             })
-            return handle_message(session_id, f"I want to book {new_service_name}")
+            # Route their original message as a normal intent
+            return handle_message(session_id, original_pivot_message)
 
-        elif _is_no(user_message):
+        elif yn == "no":
+            # Continue screening where they left off
             update_session(session_id, {
                 "pending_new_service_id": None,
                 "pending_new_service_name": None,
+                "pending_pivot_message": None,
                 "stage": "ready",
             })
             answers = session.get("screening_answers", {})
@@ -458,21 +549,26 @@ def handle_message(session_id: str, user_message: str) -> str:
             if current_q:
                 q_num = get_question_number(current_q["id"])
                 context = (
-                    f"User wants to continue the screening for {current_svc_name}. "
-                    f"Re-ask this question naturally: "
+                    f"User wants to continue the {current_svc_name} screening. "
+                    f"Re-ask this question naturally and warmly: "
                     f"Question {q_num} of {len(SCREENING_QUESTIONS)}: {current_q['question']}"
                 )
                 response = _generate_response(context, user_message, history)
             else:
-                response = "Let's continue! " + SCREENING_QUESTIONS[0]["question"]
+                response = _generate_response(
+                    f"Let's continue the {current_svc_name} screening.",
+                    user_message, history,
+                )
             add_turn(session_id, user_message, response)
             return response
 
         else:
+            # Unclear — ask again naturally
             context = (
-                f"User gave an unclear response. Ask them clearly: do they want to stop "
-                f"the {current_svc_name} screening and switch to {new_service_name}, "
-                f"or continue with the {current_svc_name} screening?"
+                f"User gave an unclear response. They were mid-screening for {current_svc_name} "
+                f"and asked about '{new_service_name}'. Ask them clearly but warmly: "
+                f"would they like to pause the screening and address their question about "
+                f"{new_service_name} first, or continue the {current_svc_name} screening now?"
             )
             response = _generate_response(context, user_message, history)
             add_turn(session_id, user_message, response)
@@ -508,6 +604,7 @@ def handle_message(session_id: str, user_message: str) -> str:
                 "stage": "ready",
                 "needs_contact_after": True,
             })
+            add_turn(session_id, user_message, "")
             stage = "ready"
         elif _looks_like_name(user_message):
             visitor_name = user_message.strip().title()
@@ -521,6 +618,7 @@ def handle_message(session_id: str, user_message: str) -> str:
             return response
         else:
             update_session(session_id, {"stage": "ready", "needs_name_after": True})
+            add_turn(session_id, user_message, "")
             stage = "ready"
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -617,7 +715,7 @@ def handle_message(session_id: str, user_message: str) -> str:
         branch_id = (
             session.get("pending_consultation_branch_id")
             or selected.get("branch_id")
-            or (selected.get("branches", {}) or {}).get("id")
+            or (selected.get("branches") or {}).get("id")
         )
 
         if not session.get("visitor_contact") and not session.get("client_id"):
@@ -680,7 +778,7 @@ def handle_message(session_id: str, user_message: str) -> str:
         branch_id = (
             session.get("pending_consultation_branch_id")
             or (selected.get("branch_id") if selected else None)
-            or ((selected.get("branches", {}) or {}).get("id") if selected else None)
+            or ((selected.get("branches") or {}).get("id") if selected else None)
         )
 
         if not selected or not service_id:
@@ -732,7 +830,7 @@ def handle_message(session_id: str, user_message: str) -> str:
         branch_id = (
             session.get("last_branch_id")
             or selected.get("branch_id")
-            or (selected.get("branches", {}) or {}).get("id")
+            or (selected.get("branches") or {}).get("id")
         )
 
         try:
@@ -937,7 +1035,6 @@ def handle_message(session_id: str, user_message: str) -> str:
         service_name_raw = entities.get("service", "")
         service_id = resolve_service_id(service_name_raw) if service_name_raw else None
 
-        # Fall back to last known service
         if not service_id:
             service_id = session.get("last_service_id")
             service_name_raw = session.get("last_service_name", "")
