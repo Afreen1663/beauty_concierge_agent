@@ -179,8 +179,14 @@ def _format_slots(slots: list) -> str:
 # RESPONSE GENERATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _generate_response(tool_result: str, user_message: str, history: list) -> str:
-    messages = [{"role": "system", "content": _RESPONSE_SYSTEM}]
+def _generate_response(tool_result: str, user_message: str, history: list, visitor_name: str = "") -> str:
+    name_instruction = (
+        f" The visitor's name is {visitor_name} — always use this name, never infer a name from their email or any other source."
+        if visitor_name else
+        " Do not infer or guess the visitor's name from their email address or any other source."
+    )
+    system_content = _RESPONSE_SYSTEM + name_instruction
+    messages = [{"role": "system", "content": system_content}]
     messages.extend(history[-6:])
     messages.append({
         "role": "user",
@@ -293,6 +299,7 @@ def _resolve_date_str(raw_date):
 def _run_availability_and_show_slots(
     session_id, service_id, service_name, entities,
     user_message, history, next_stage="awaiting_slot_selection",
+    visitor_name="",
 ):
     session = get_session(session_id)
     branch_id = session.get("last_branch_id")
@@ -342,7 +349,7 @@ def _run_availability_and_show_slots(
         update_session(session_id, {"stage": "ready"})
         context = f"No availability found for {service_name} and no alternative slots either."
 
-    return _generate_response(context, user_message, history)
+    return _generate_response(context, user_message, history, visitor_name)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -351,6 +358,7 @@ def _run_availability_and_show_slots(
 
 def _book_consultation_slots(
     session_id, spmu_service_id, branch_id, service_name, user_message, history,
+    visitor_name="",
 ):
     consult_service_id = get_consultation_service_id(spmu_service_id) or spmu_service_id
     avail = check_availability(consult_service_id, branch_id)
@@ -374,7 +382,7 @@ def _book_consultation_slots(
             "Ask the user to call either branch directly and the team will sort them out."
         )
 
-    return _generate_response(context, user_message, history)
+    return _generate_response(context, user_message, history, visitor_name)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -398,6 +406,7 @@ def handle_message(session_id: str, user_message: str) -> str:
     if (
         session.get("screening_service_id")
         and len(session.get("screening_answers", {})) < len(SCREENING_QUESTIONS)
+        and stage != "awaiting_screening_switch_confirm"
     ):
         answers = session["screening_answers"]
 
@@ -472,7 +481,7 @@ def handle_message(session_id: str, user_message: str) -> str:
                     f"screening and come back to it, or continue with the screening now. "
                     f"Don't be robotic — make it feel like a natural conversation."
                 )
-                response = _generate_response(context, user_message, history)
+                response = _generate_response(context, user_message, history, name)
                 add_turn(session_id, user_message, response)
                 return response
 
@@ -486,7 +495,7 @@ def handle_message(session_id: str, user_message: str) -> str:
                     f"Then re-ask this screening question naturally: "
                     f"Question {q_num} of {len(SCREENING_QUESTIONS)}: {current_q['question']}"
                 )
-                response = _generate_response(context, user_message, history)
+                response = _generate_response(context, user_message, history, name)
                 add_turn(session_id, user_message, response)
                 return response
 
@@ -499,7 +508,7 @@ def handle_message(session_id: str, user_message: str) -> str:
                     f"After explaining, naturally re-ask the same question: "
                     f"Question {q_num} of {len(SCREENING_QUESTIONS)}: {current_q['question']}"
                 )
-                response = _generate_response(context, user_message, history)
+                response = _generate_response(context, user_message, history, name)
                 add_turn(session_id, user_message, response)
                 return response
 
@@ -509,7 +518,7 @@ def handle_message(session_id: str, user_message: str) -> str:
                 f"and not a topic change. Gently ask them to answer the screening question: "
                 f"Question {q_num} of {len(SCREENING_QUESTIONS)}: {current_q['question']}"
             )
-            response = _generate_response(context, user_message, history)
+            response = _generate_response(context, user_message, history, name)
             add_turn(session_id, user_message, response)
             return response
 
@@ -553,11 +562,11 @@ def handle_message(session_id: str, user_message: str) -> str:
                     f"Re-ask this question naturally and warmly: "
                     f"Question {q_num} of {len(SCREENING_QUESTIONS)}: {current_q['question']}"
                 )
-                response = _generate_response(context, user_message, history)
+                response = _generate_response(context, user_message, history, name)
             else:
                 response = _generate_response(
                     f"Let's continue the {current_svc_name} screening.",
-                    user_message, history,
+                    user_message, history, name,
                 )
             add_turn(session_id, user_message, response)
             return response
@@ -570,7 +579,7 @@ def handle_message(session_id: str, user_message: str) -> str:
                 f"would they like to pause the screening and address their question about "
                 f"{new_service_name} first, or continue the {current_svc_name} screening now?"
             )
-            response = _generate_response(context, user_message, history)
+            response = _generate_response(context, user_message, history, name)
             add_turn(session_id, user_message, response)
             return response
 
@@ -678,7 +687,7 @@ def handle_message(session_id: str, user_message: str) -> str:
             branch_id = session.get("pending_consultation_branch_id")
             service_name = session.get("last_service_name", "this service")
             response = _book_consultation_slots(
-                session_id, spmu_service_id, branch_id, service_name, user_message, history,
+                session_id, spmu_service_id, branch_id, service_name, user_message, history, name,
             )
             add_turn(session_id, user_message, response)
             return response
@@ -701,12 +710,12 @@ def handle_message(session_id: str, user_message: str) -> str:
 
         if choice == -1:
             context = f"User gave an invalid slot choice. There are {len(slots)} options numbered 1 to {len(slots)}. Ask them again naturally."
-            response = _generate_response(context, user_message, history)
+            response = _generate_response(context, user_message, history, name)
             add_turn(session_id, user_message, response)
             return response
         if choice is None:
             context = f"User gave an out-of-range slot choice. There are {len(slots)} options numbered 1 to {len(slots)}. Ask them again naturally."
-            response = _generate_response(context, user_message, history)
+            response = _generate_response(context, user_message, history, name)
             add_turn(session_id, user_message, response)
             return response
 
@@ -815,12 +824,12 @@ def handle_message(session_id: str, user_message: str) -> str:
 
         if choice == -1:
             context = f"User gave an invalid slot choice. There are {len(slots)} options numbered 1 to {len(slots)}. Ask them again naturally."
-            response = _generate_response(context, user_message, history)
+            response = _generate_response(context, user_message, history, name)
             add_turn(session_id, user_message, response)
             return response
         if choice is None:
             context = f"User gave an out-of-range slot choice. There are {len(slots)} options numbered 1 to {len(slots)}. Ask them again naturally."
-            response = _generate_response(context, user_message, history)
+            response = _generate_response(context, user_message, history, name)
             add_turn(session_id, user_message, response)
             return response
 
@@ -872,7 +881,7 @@ def handle_message(session_id: str, user_message: str) -> str:
             f"Price: AED {svc['price_aed']:.0f}\n\n"
             "Present this summary naturally and ask if they'd like to confirm."
         )
-        response = _generate_response(context, user_message, history)
+        response = _generate_response(context, user_message, history, name)
         add_turn(session_id, user_message, response)
         return response
 
@@ -927,7 +936,7 @@ def handle_message(session_id: str, user_message: str) -> str:
         else:
             svc = session.get("pending_service", {})
             context = f"User gave an unclear response. Ask them again whether they want to confirm the {svc.get('name', 'booking')} — keep it natural."
-            response = _generate_response(context, user_message, history)
+            response = _generate_response(context, user_message, history, name)
             add_turn(session_id, user_message, response)
             return response
 
@@ -1010,7 +1019,7 @@ def handle_message(session_id: str, user_message: str) -> str:
                 "This is a new visitor. Welcome them warmly and introduce Luma. "
                 "Then ask for their name to get started."
             )
-        response = _generate_response(greeting_context, user_message, history)
+        response = _generate_response(greeting_context, user_message, history, name)
         if not name:
             update_session(session_id, {"stage": "collect_name"})
         add_turn(session_id, user_message, response)
@@ -1019,7 +1028,7 @@ def handle_message(session_id: str, user_message: str) -> str:
     # ── FAQ ───────────────────────────────────────────────────────────────────
     if intent == "faq_general":
         result = lookup_faq(user_message)
-        response = _generate_response(result["answer"], user_message, history)
+        response = _generate_response(result["answer"], user_message, history, name)
         add_turn(session_id, user_message, response)
         return response
 
@@ -1046,7 +1055,7 @@ def handle_message(session_id: str, user_message: str) -> str:
                 "If they mentioned something we don't offer like a haircut, "
                 "acknowledge it and explain what we do specialise in."
             )
-            response = _generate_response(context, user_message, history)
+            response = _generate_response(context, user_message, history, name)
             add_turn(session_id, user_message, response)
             return response
 
@@ -1084,6 +1093,7 @@ def handle_message(session_id: str, user_message: str) -> str:
                 entities=entities,
                 user_message=user_message,
                 history=history,
+                visitor_name=name,
             )
 
         elif gate["status"] in ("NEEDS_CONSULTATION", "CLEARANCE_EXPIRED"):
@@ -1092,7 +1102,7 @@ def handle_message(session_id: str, user_message: str) -> str:
                 "pending_consultation_branch_id": session.get("last_branch_id"),
                 "stage": "awaiting_consultation_confirm",
             })
-            response = _generate_response(gate["message"], user_message, history)
+            response = _generate_response(gate["message"], user_message, history, name)
 
         elif gate["status"] == "NEEDS_SCREENING":
             if _is_yes(user_message) or intent == "create_booking":
@@ -1108,18 +1118,18 @@ def handle_message(session_id: str, user_message: str) -> str:
                     f"Question 1 of {len(SCREENING_QUESTIONS)}: {first_q['question']}"
                 )
             else:
-                response = _generate_response(gate["message"], user_message, history)
+                response = _generate_response(gate["message"], user_message, history, name)
 
         elif gate["status"] == "SCREENING_PENDING":
-            response = _generate_response(gate["message"], user_message, history)
+            response = _generate_response(gate["message"], user_message, history, name)
 
         elif gate["status"] == "HARD_BLOCK":
-            response = _generate_response(gate["message"], user_message, history)
+            response = _generate_response(gate["message"], user_message, history, name)
 
         else:
             response = _generate_response(
                 "Unable to check service requirements right now. Please call the branch directly.",
-                user_message, history,
+                user_message, history, name,
             )
 
         add_turn(session_id, user_message, response)
@@ -1153,7 +1163,7 @@ def handle_message(session_id: str, user_message: str) -> str:
         response = _book_consultation_slots(
             session_id, service_id, branch_id,
             session.get("last_service_name", service_name_raw.title() if service_name_raw else "this service"),
-            user_message, history,
+            user_message, history, name,
         )
         add_turn(session_id, user_message, response)
         return response
@@ -1172,7 +1182,7 @@ def handle_message(session_id: str, user_message: str) -> str:
         elif service_id:
             gate = check_service_gate(service_id, client_id)
             msg = gate.get("message") or f"Your clearance for {service_name_raw} is valid — you're good to book."
-            response = _generate_response(msg, user_message, history)
+            response = _generate_response(msg, user_message, history, name)
         else:
             response = "Which service's clearance would you like to check? (e.g. brow SPMU, lip filler)"
         add_turn(session_id, user_message, response)
@@ -1193,11 +1203,11 @@ def handle_message(session_id: str, user_message: str) -> str:
             if service_id:
                 gate = check_service_gate(service_id, client_id)
                 if gate["status"] == "HARD_BLOCK":
-                    response = _generate_response(gate["message"], user_message, history)
+                    response = _generate_response(gate["message"], user_message, history, name)
                 else:
                     response = _generate_response(
                         f"You can rebook {service_name_raw} — no frequency block is active on your account.",
-                        user_message, history,
+                        user_message, history, name,
                     )
             else:
                 response = "Which service would you like to check the rebooking interval for?"
@@ -1218,7 +1228,7 @@ def handle_message(session_id: str, user_message: str) -> str:
                 response = _generate_response(
                     f"Client wants to modify booking {booking_ref}. "
                     "Direct them to call the branch or connect them with the team.",
-                    user_message, history,
+                    user_message, history, name,
                 )
             else:
                 response = "Which booking would you like to change? Please share your booking reference (e.g. BKG-2026-XXXX)."
@@ -1242,12 +1252,12 @@ def handle_message(session_id: str, user_message: str) -> str:
                     ).eq("id", booking_ref).eq("client_id", client_id).execute()
                     response = _generate_response(
                         f"Booking {booking_ref} has been cancelled successfully.",
-                        user_message, history,
+                        user_message, history, name,
                     )
                 except Exception:
                     response = _generate_response(
                         "Unable to cancel the booking right now. Please call the branch directly.",
-                        user_message, history,
+                        user_message, history, name,
                     )
             else:
                 response = "Which booking would you like to cancel? Please share the booking reference (e.g. BKG-2026-XXXX)."
@@ -1265,12 +1275,12 @@ def handle_message(session_id: str, user_message: str) -> str:
                 ).eq("id", booking_ref).execute()
                 response = _generate_response(
                     f"Note added to booking {booking_ref}: '{notes_text}'.",
-                    user_message, history,
+                    user_message, history, name,
                 )
             except Exception:
                 response = _generate_response(
                     "I wasn't able to add the note right now. Please call the branch and they'll add it for you.",
-                    user_message, history,
+                    user_message, history, name,
                 )
         else:
             response = "Which booking would you like to add a note to? Please share the booking reference and your note."
@@ -1295,18 +1305,18 @@ def handle_message(session_id: str, user_message: str) -> str:
                         f"Payment link for {booking_ref}:\n"
                         f"Amount: AED {bk['deposit_amount_aed']:.0f}\n"
                         f"Link: {bk['payment_link']}\n(Valid for 24 hours)",
-                        user_message, history,
+                        user_message, history, name,
                     )
                 else:
                     response = _generate_response(
                         f"No payment link found for {booking_ref}. "
                         "This booking may already be paid, or doesn't require payment.",
-                        user_message, history,
+                        user_message, history, name,
                     )
             except Exception:
                 response = _generate_response(
                     "Unable to retrieve the payment link right now. Please call the branch directly.",
-                    user_message, history,
+                    user_message, history, name,
                 )
         else:
             response = "Which booking would you like the payment link for? Please share your booking reference (e.g. BKG-2026-XXXX)."
@@ -1316,13 +1326,13 @@ def handle_message(session_id: str, user_message: str) -> str:
     # ── Fallback ───────────────────────────────────────────────────────────────
     faq_result = lookup_faq(user_message)
     if faq_result["status"] == "FOUND":
-        response = _generate_response(faq_result["answer"], user_message, history)
+        response = _generate_response(faq_result["answer"], user_message, history, name)
     else:
         response = _generate_response(
             "I'm not sure how to help with that. "
             "I can help you book an appointment, check availability, "
             "answer questions about our services, or connect you with the team.",
-            user_message, history,
+            user_message, history, name,
         )
 
     # ── Post-turn: ask for name/contact if deferred ────────────────────────────
