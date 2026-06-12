@@ -28,6 +28,7 @@ VALID_INTENTS = [
     "book_consultation",
     "check_clearance_status",
     "check_frequency",
+    "off_topic",
 ]
 
 SYSTEM_PROMPT = """You are an intent classifier for Luma — a luxury beauty and wellness booking assistant in Dubai.
@@ -50,6 +51,7 @@ Valid intents:
 - book_consultation     — user wants to book a free consultation or patch test
 - check_clearance_status — user wants to know if their clearance / patch test is on file
 - check_frequency       — user wants to know if they can rebook a treatment soon
+- off-topic             - users asks something irrelevant to makeup, skincare, beauty, medical condition, medical procedure, aesthetic treatment etc
 
 Entity fields to extract if present:
 - service   : treatment name (e.g. "brow lamination", "lip filler", "anti-wrinkle injections")
@@ -69,6 +71,7 @@ Classification rules:
 - "check if there's a slot AND book it" → create_booking (multi-intent resolved as booking)
 - If confidence < 0.60 use faq_general as fallback, NOT escalate_human
 - escalate_human only when user explicitly says "speak to someone", "talk to a person", "human agent", etc.
+
 
 Examples:
 {"intent":"greeting_smalltalk","entities":{},"confidence":0.97}
