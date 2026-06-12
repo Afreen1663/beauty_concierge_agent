@@ -886,17 +886,6 @@ def handle_message(session_id: str, user_message: str) -> str:
         add_turn(session_id, user_message, response)
         return response
 
-    # ── Off-topic guardrail ──────────────────────────────────────────────────
-    if intent == "off_topic":
-        response = (
-            "I'm only able to help with beauty and wellness queries — "
-            "bookings, treatments, skincare, and procedures. "
-            "For anything else, please contact our branch directly."
-        )
-        add_turn(session_id, user_message, response)
-        return response
-
-
     # ── Greeting ────────────────────────────────────────────────────────────
     if intent == "greeting_smalltalk":
         if name:

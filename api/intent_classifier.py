@@ -28,7 +28,6 @@ VALID_INTENTS = [
     "book_consultation",
     "check_clearance_status",
     "check_frequency",
-    "off_topic",
 ]
 
 SYSTEM_PROMPT = """You are an intent classifier for Luma — a luxury beauty and wellness booking assistant in Dubai.
@@ -51,7 +50,6 @@ Valid intents:
 - book_consultation     — user wants to book a free consultation or patch test
 - check_clearance_status — user wants to know if their clearance / patch test is on file
 - check_frequency       — user wants to know if they can rebook a treatment soon
-- off-topic             - users asks something irrelevant to makeup, skincare, beauty, medical condition, medical procedure, aesthetic treatment etc
 
 Entity fields to extract if present:
 - service   : treatment name (e.g. "brow lamination", "lip filler", "anti-wrinkle injections")
