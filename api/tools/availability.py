@@ -169,18 +169,57 @@ def check_availability(
 
 
 def resolve_service_id(service_name: str) -> str | None:
+    """
+    Resolves a service ID from a string.
+
+    Handles two cases:
+    1. service_name is a short, clean service name (e.g. "Brow SPMU")
+       -> direct ilike match
+    2. service_name is a full sentence (e.g. "I want to book Brow SPMU")
+       -> fetch all services and check if any service name appears
+          as a substring within the message (longest match wins)
+    """
+    text = service_name.strip()
+    if not text:
+        return None
+
     try:
+        # First try: direct ilike match (works for clean short strings)
         result = (
             supabase.table("services")
             .select("id, name")
-            .ilike("name", f"%{service_name}%")
+            .ilike("name", f"%{text}%")
             .limit(1)
             .execute()
         )
         if result.data:
             return result.data[0]["id"]
+
+        # Second try: reverse match — does any service name appear
+        # inside the user's message? Pick the longest matching name
+        # to avoid short names (e.g. "Lip") matching too eagerly.
+        all_services = (
+            supabase.table("services")
+            .select("id, name")
+            .execute()
+        )
+        lower_text = text.lower()
+        best_match = None
+        best_len = 0
+
+        for svc in (all_services.data or []):
+            svc_name_lower = svc["name"].lower()
+            if svc_name_lower in lower_text:
+                if len(svc_name_lower) > best_len:
+                    best_match = svc
+                    best_len = len(svc_name_lower)
+
+        if best_match:
+            return best_match["id"]
+
     except Exception as e:
         print(f"[AVAILABILITY] resolve_service_id error: {e}")
+
     return None
 
 

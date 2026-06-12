@@ -1,4 +1,5 @@
-"""agent_controller.py — Core orchestration layer for Luma booking concierge.
+"""
+agent_controller.py — Core orchestration layer for Luma booking concierge.
 
 Conversation stage machine:
   collect_name                      — awaiting visitor full name
@@ -13,13 +14,12 @@ Conversation stage machine:
   collect_contact_for_booking       — mid-flow contact collection (regular booking)
   collect_name_for_consultation     — mid-flow name collection (consultation booking)
   collect_contact_for_consultation  — mid-flow contact collection (consultation)
-  awaiting_screening_switch_confirm — user pivoted to different topic mid-screening
+  awaiting_screening_switch_confirm — user asked for different service mid-screening
   collect_contact_post_screening    — gathering contact after screening submission
 """
 
 import os
 import re
-import json
 from openai import OpenAI
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
@@ -83,61 +83,22 @@ def _looks_like_name(text: str) -> bool:
     return alpha_ratio > 0.85
 
 
-def _interpret_yes_no(text: str) -> str:
-    """
-    Uses GPT-4o to intelligently interpret yes/no intent from natural language.
-    Returns 'yes', 'no', or 'unclear'.
-    """
-    text = text.strip()
-    if not text:
-        return "unclear"
-    try:
-        resp = _openai.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are interpreting whether a person's response means YES, NO, or is UNCLEAR. "
-                        "Consider colloquial expressions, hedging, and indirect answers. "
-                        "Examples: 'i dont think so' = NO, 'not really' = NO, 'absolutely' = YES, "
-                        "'sounds good' = YES, 'maybe' = UNCLEAR, 'what do you mean' = UNCLEAR. "
-                        "Respond with exactly one word: YES, NO, or UNCLEAR. Nothing else."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": f"The person said: \"{text}\"\n\nDoes this mean YES, NO, or UNCLEAR?"
-                }
-            ],
-            temperature=0,
-            max_tokens=5,
-        )
-        result = resp.choices[0].message.content.strip().upper()
-        if result == "YES":
-            return "yes"
-        if result == "NO":
-            return "no"
-        return "unclear"
-    except Exception:
-        # Fallback to keyword matching
-        t = text.lower()
-        if any(w in t for w in ["yes", "yeah", "yep", "sure", "ok", "okay", "confirm",
-                                  "go ahead", "book it", "absolutely", "perfect", "alright",
-                                  "of course", "definitely", "sounds good"]):
-            return "yes"
-        if any(w in t for w in ["no", "nope", "nah", "cancel", "stop", "dont",
-                                  "don't", "never mind", "nevermind", "not really"]):
-            return "no"
-        return "unclear"
-
-
 def _is_yes(text: str) -> bool:
-    return _interpret_yes_no(text) == "yes"
+    t = text.lower().strip()
+    return any(w in t for w in [
+        "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "please",
+        "go ahead", "book it", "confirm", "correct", "absolutely",
+        "definitely", "do it", "sounds good", "great", "let's go",
+        "lets go", "perfect", "alright", "all right", "of course",
+    ])
 
 
 def _is_no(text: str) -> bool:
-    return _interpret_yes_no(text) == "no"
+    t = text.lower().strip()
+    return any(w in t for w in [
+        "no", "nope", "nah", "cancel", "stop", "don't",
+        "dont", "never mind", "nevermind", "not now", "skip",
+    ])
 
 
 def _parse_slot_choice(text: str, slot_count: int):
@@ -179,14 +140,8 @@ def _format_slots(slots: list) -> str:
 # RESPONSE GENERATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _generate_response(tool_result: str, user_message: str, history: list, visitor_name: str = "") -> str:
-    name_instruction = (
-        f" The visitor's name is {visitor_name} — always use this name, never infer a name from their email or any other source."
-        if visitor_name else
-        " Do not infer or guess the visitor's name from their email address or any other source."
-    )
-    system_content = _RESPONSE_SYSTEM + name_instruction
-    messages = [{"role": "system", "content": system_content}]
+def _generate_response(tool_result: str, user_message: str, history: list) -> str:
+    messages = [{"role": "system", "content": _RESPONSE_SYSTEM}]
     messages.extend(history[-6:])
     messages.append({
         "role": "user",
@@ -222,53 +177,6 @@ def _save_visitor(name: str, contact: str) -> None:
         print(f"[VISITOR SAVE] Non-fatal: {e}")
 
 
-def _detect_pivot(user_message: str, current_question: str, service_name: str) -> dict:
-    """
-    Uses GPT-4o to detect whether the user has pivoted away from a screening question.
-    Returns {"is_pivot": bool, "pivot_topic": str or None}
-    """
-    try:
-        resp = _openai.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are helping a beauty salon booking assistant detect "
-                        "when a user has changed topic mid-conversation.\n\n"
-                        f"The user is currently answering medical screening questions "
-                        f"for a treatment called '{service_name}'. "
-                        f"The current question was: '{current_question}'\n\n"
-                        "Determine if the user's message is:\n"
-                        "A) A direct answer or response to the screening question "
-                        "(yes/no/clarification about the question/asking what a term means)\n"
-                        "B) A pivot to a completely different topic "
-                        "(asking about a different service, asking about hours/prices/location, "
-                        "asking an unrelated question, making a new booking request)\n\n"
-                        "If B, identify the topic in 3-5 words.\n\n"
-                        "Respond in JSON only, no markdown:\n"
-                        "{\"is_pivot\": true/false, \"pivot_topic\": \"topic or null\"}"
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": f"User said: \"{user_message}\""
-                }
-            ],
-            temperature=0,
-            max_tokens=60,
-        )
-        raw = resp.choices[0].message.content.strip()
-        parsed = json.loads(raw)
-        return {
-            "is_pivot": bool(parsed.get("is_pivot", False)),
-            "pivot_topic": parsed.get("pivot_topic"),
-        }
-    except Exception as e:
-        print(f"[PIVOT DETECT] Error: {e}")
-        return {"is_pivot": False, "pivot_topic": None}
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # AVAILABILITY HELPER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -299,7 +207,6 @@ def _resolve_date_str(raw_date):
 def _run_availability_and_show_slots(
     session_id, service_id, service_name, entities,
     user_message, history, next_stage="awaiting_slot_selection",
-    visitor_name="",
 ):
     session = get_session(session_id)
     branch_id = session.get("last_branch_id")
@@ -349,7 +256,7 @@ def _run_availability_and_show_slots(
         update_session(session_id, {"stage": "ready"})
         context = f"No availability found for {service_name} and no alternative slots either."
 
-    return _generate_response(context, user_message, history, visitor_name)
+    return _generate_response(context, user_message, history)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -358,7 +265,6 @@ def _run_availability_and_show_slots(
 
 def _book_consultation_slots(
     session_id, spmu_service_id, branch_id, service_name, user_message, history,
-    visitor_name="",
 ):
     consult_service_id = get_consultation_service_id(spmu_service_id) or spmu_service_id
     avail = check_availability(consult_service_id, branch_id)
@@ -382,7 +288,7 @@ def _book_consultation_slots(
             "Ask the user to call either branch directly and the team will sort them out."
         )
 
-    return _generate_response(context, user_message, history, visitor_name)
+    return _generate_response(context, user_message, history)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -406,7 +312,6 @@ def handle_message(session_id: str, user_message: str) -> str:
     if (
         session.get("screening_service_id")
         and len(session.get("screening_answers", {})) < len(SCREENING_QUESTIONS)
-        and stage != "awaiting_screening_switch_confirm"
     ):
         answers = session["screening_answers"]
 
@@ -418,74 +323,40 @@ def handle_message(session_id: str, user_message: str) -> str:
 
         if current_q:
             q_num = get_question_number(current_q["id"])
-            current_svc_name = session.get("last_service_name", "your treatment")
 
-            # ── Step 1: Check if it's a plain yes/no first (cheapest check) ──
-            plain_answer = parse_yes_no(user_message)
+            # ── Detect if user wants to switch to a different service ─────────
+            possible_service_id = resolve_service_id(user_message)
+            if possible_service_id and possible_service_id != session.get("screening_service_id"):
+                try:
+                    current_svc = supabase.table("services").select("name").eq(
+                        "id", session["screening_service_id"]
+                    ).single().execute().data
+                    new_svc = supabase.table("services").select("name").eq(
+                        "id", possible_service_id
+                    ).single().execute().data
+                    current_svc_name = current_svc["name"]
+                    new_svc_name = new_svc["name"]
+                except Exception:
+                    current_svc_name = session.get("last_service_name", "current treatment")
+                    new_svc_name = "the new treatment"
 
-            if plain_answer is not None:
-                # It's a yes/no — record the answer and move on
-                answers[current_q["id"]] = plain_answer
-                update_session(session_id, {"screening_answers": answers})
-
-                next_q = get_next_question(answers)
-                if next_q:
-                    next_q_num = get_question_number(next_q["id"])
-                    response = (
-                        f"Question {next_q_num} of {len(SCREENING_QUESTIONS)}: "
-                        f"{next_q['question']}"
-                    )
-                    add_turn(session_id, user_message, response)
-                    return response
-
-                # All 6 answered — submit
-                result = submit_screening(
-                    service_id=session["screening_service_id"],
-                    service_category=session["screening_service_category"],
-                    answers=answers,
-                    client_id=session.get("client_id"),
-                    visitor_name=session.get("visitor_name"),
-                    visitor_contact=session.get("visitor_contact"),
-                )
-                clear_screening(session_id)
-                update_session(session_id, {"stage": "ready"})
-                response = result["message"]
-                if not session.get("visitor_contact") and not session.get("client_id"):
-                    response += (
-                        "\n\nCould I also take your phone number or email? "
-                        "We'll send you updates on your screening review."
-                    )
-                    update_session(session_id, {"stage": "collect_contact_post_screening"})
-                add_turn(session_id, user_message, response)
-                return response
-
-            # ── Step 2: Not yes/no — detect if pivot or clarification ─────────
-            pivot = _detect_pivot(user_message, current_q["question"], current_svc_name)
-
-            if pivot["is_pivot"] and pivot["pivot_topic"]:
-                # User has changed topic — pause screening and handle it
-                new_svc_id = resolve_service_id(user_message)
                 update_session(session_id, {
-                    "pending_new_service_id": new_svc_id,
-                    "pending_new_service_name": pivot["pivot_topic"],
-                    "pending_pivot_message": user_message,
+                    "pending_new_service_id": possible_service_id,
+                    "pending_new_service_name": new_svc_name,
                     "stage": "awaiting_screening_switch_confirm",
                 })
                 context = (
-                    f"The user is mid-way through a medical health screening for "
-                    f"{current_svc_name} (question {q_num} of {len(SCREENING_QUESTIONS)}). "
-                    f"They just pivoted to ask about: '{pivot['pivot_topic']}'. "
-                    f"Their exact message was: '{user_message}'. "
-                    f"Respond warmly and naturally — acknowledge what they asked about, "
-                    f"then gently check whether they'd like to pause the {current_svc_name} "
-                    f"screening and come back to it, or continue with the screening now. "
-                    f"Don't be robotic — make it feel like a natural conversation."
+                    f"The user is mid-way through a medical health screening for {current_svc_name} "
+                    f"(question {q_num} of {len(SCREENING_QUESTIONS)}), "
+                    f"but they just asked about {new_svc_name} instead. "
+                    f"Ask them warmly whether they want to stop the {current_svc_name} screening "
+                    f"and switch to {new_svc_name}, or continue with the {current_svc_name} screening."
                 )
-                response = _generate_response(context, user_message, history, name)
+                response = _generate_response(context, user_message, history)
                 add_turn(session_id, user_message, response)
                 return response
 
-            # ── Step 3: Not a pivot — must be clarification or unclear answer ─
+            # ── User says treatment is for someone else ───────────────────────
             if is_for_someone_else(user_message):
                 update_session(session_id, {"screening_for": user_message.strip()})
                 context = (
@@ -495,10 +366,11 @@ def handle_message(session_id: str, user_message: str) -> str:
                     f"Then re-ask this screening question naturally: "
                     f"Question {q_num} of {len(SCREENING_QUESTIONS)}: {current_q['question']}"
                 )
-                response = _generate_response(context, user_message, history, name)
+                response = _generate_response(context, user_message, history)
                 add_turn(session_id, user_message, response)
                 return response
 
+            # ── User is asking for clarification ─────────────────────────────
             if is_clarification_question(user_message):
                 context = (
                     f"The user is asking for clarification during a medical screening. "
@@ -508,49 +380,77 @@ def handle_message(session_id: str, user_message: str) -> str:
                     f"After explaining, naturally re-ask the same question: "
                     f"Question {q_num} of {len(SCREENING_QUESTIONS)}: {current_q['question']}"
                 )
-                response = _generate_response(context, user_message, history, name)
+                response = _generate_response(context, user_message, history)
                 add_turn(session_id, user_message, response)
                 return response
 
-            # Genuinely unclear — ask again
-            context = (
-                f"The user's response '{user_message}' is unclear — not a clear yes or no, "
-                f"and not a topic change. Gently ask them to answer the screening question: "
-                f"Question {q_num} of {len(SCREENING_QUESTIONS)}: {current_q['question']}"
+            # ── Standard yes/no answer ────────────────────────────────────────
+            parsed = parse_yes_no(user_message)
+            if parsed is None:
+                context = (
+                    f"The user's response '{user_message}' is unclear — not a clear yes or no. "
+                    f"Gently ask them again: "
+                    f"Question {q_num} of {len(SCREENING_QUESTIONS)}: {current_q['question']}"
+                )
+                response = _generate_response(context, user_message, history)
+                add_turn(session_id, user_message, response)
+                return response
+
+            answers[current_q["id"]] = parsed
+            update_session(session_id, {"screening_answers": answers})
+
+            next_q = get_next_question(answers)
+            if next_q:
+                next_q_num = get_question_number(next_q["id"])
+                response = (
+                    f"Question {next_q_num} of {len(SCREENING_QUESTIONS)}: "
+                    f"{next_q['question']}"
+                )
+                add_turn(session_id, user_message, response)
+                return response
+
+            # ── All 6 answered — submit ───────────────────────────────────────
+            result = submit_screening(
+                service_id=session["screening_service_id"],
+                service_category=session["screening_service_category"],
+                answers=answers,
+                client_id=session.get("client_id"),
+                visitor_name=session.get("visitor_name"),
+                visitor_contact=session.get("visitor_contact"),
             )
-            response = _generate_response(context, user_message, history, name)
+            clear_screening(session_id)
+            update_session(session_id, {"stage": "ready"})
+            response = result["message"]
+            if not session.get("visitor_contact") and not session.get("client_id"):
+                response += (
+                    "\n\nCould I also take your phone number or email? "
+                    "We'll send you updates on your screening review."
+                )
+                update_session(session_id, {"stage": "collect_contact_post_screening"})
             add_turn(session_id, user_message, response)
             return response
 
     # ─────────────────────────────────────────────────────────────────────────
-    # STAGE: USER PIVOTED MID-SCREENING — awaiting their decision
+    # STAGE: USER WANTS TO SWITCH SERVICE MID-SCREENING
     # ─────────────────────────────────────────────────────────────────────────
     if stage == "awaiting_screening_switch_confirm":
-        new_service_name = session.get("pending_new_service_name", "the new topic")
         new_service_id = session.get("pending_new_service_id")
+        new_service_name = session.get("pending_new_service_name", "the new treatment")
         current_svc_name = session.get("last_service_name", "current treatment")
-        original_pivot_message = session.get("pending_pivot_message", user_message)
 
-        yn = _interpret_yes_no(user_message)
-
-        if yn == "yes":
-            # Pause screening (preserve state), handle their other topic
+        if _is_yes(user_message):
+            clear_screening(session_id)
             update_session(session_id, {
                 "pending_new_service_id": None,
                 "pending_new_service_name": None,
-                "pending_pivot_message": None,
                 "stage": "ready",
-                # screening_service_id and screening_answers intentionally preserved
             })
-            # Route their original message as a normal intent
-            return handle_message(session_id, original_pivot_message)
+            return handle_message(session_id, f"I want to book {new_service_name}")
 
-        elif yn == "no":
-            # Continue screening where they left off
+        elif _is_no(user_message):
             update_session(session_id, {
                 "pending_new_service_id": None,
                 "pending_new_service_name": None,
-                "pending_pivot_message": None,
                 "stage": "ready",
             })
             answers = session.get("screening_answers", {})
@@ -558,28 +458,23 @@ def handle_message(session_id: str, user_message: str) -> str:
             if current_q:
                 q_num = get_question_number(current_q["id"])
                 context = (
-                    f"User wants to continue the {current_svc_name} screening. "
-                    f"Re-ask this question naturally and warmly: "
+                    f"User wants to continue the screening for {current_svc_name}. "
+                    f"Re-ask this question naturally: "
                     f"Question {q_num} of {len(SCREENING_QUESTIONS)}: {current_q['question']}"
                 )
-                response = _generate_response(context, user_message, history, name)
+                response = _generate_response(context, user_message, history)
             else:
-                response = _generate_response(
-                    f"Let's continue the {current_svc_name} screening.",
-                    user_message, history, name,
-                )
+                response = "Let's continue! " + SCREENING_QUESTIONS[0]["question"]
             add_turn(session_id, user_message, response)
             return response
 
         else:
-            # Unclear — ask again naturally
             context = (
-                f"User gave an unclear response. They were mid-screening for {current_svc_name} "
-                f"and asked about '{new_service_name}'. Ask them clearly but warmly: "
-                f"would they like to pause the screening and address their question about "
-                f"{new_service_name} first, or continue the {current_svc_name} screening now?"
+                f"User gave an unclear response. Ask them clearly: do they want to stop "
+                f"the {current_svc_name} screening and switch to {new_service_name}, "
+                f"or continue with the {current_svc_name} screening?"
             )
-            response = _generate_response(context, user_message, history, name)
+            response = _generate_response(context, user_message, history)
             add_turn(session_id, user_message, response)
             return response
 
@@ -613,7 +508,6 @@ def handle_message(session_id: str, user_message: str) -> str:
                 "stage": "ready",
                 "needs_contact_after": True,
             })
-            add_turn(session_id, user_message, "")
             stage = "ready"
         elif _looks_like_name(user_message):
             visitor_name = user_message.strip().title()
@@ -627,7 +521,6 @@ def handle_message(session_id: str, user_message: str) -> str:
             return response
         else:
             update_session(session_id, {"stage": "ready", "needs_name_after": True})
-            add_turn(session_id, user_message, "")
             stage = "ready"
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -687,7 +580,7 @@ def handle_message(session_id: str, user_message: str) -> str:
             branch_id = session.get("pending_consultation_branch_id")
             service_name = session.get("last_service_name", "this service")
             response = _book_consultation_slots(
-                session_id, spmu_service_id, branch_id, service_name, user_message, history, name,
+                session_id, spmu_service_id, branch_id, service_name, user_message, history,
             )
             add_turn(session_id, user_message, response)
             return response
@@ -710,12 +603,12 @@ def handle_message(session_id: str, user_message: str) -> str:
 
         if choice == -1:
             context = f"User gave an invalid slot choice. There are {len(slots)} options numbered 1 to {len(slots)}. Ask them again naturally."
-            response = _generate_response(context, user_message, history, name)
+            response = _generate_response(context, user_message, history)
             add_turn(session_id, user_message, response)
             return response
         if choice is None:
             context = f"User gave an out-of-range slot choice. There are {len(slots)} options numbered 1 to {len(slots)}. Ask them again naturally."
-            response = _generate_response(context, user_message, history, name)
+            response = _generate_response(context, user_message, history)
             add_turn(session_id, user_message, response)
             return response
 
@@ -724,7 +617,7 @@ def handle_message(session_id: str, user_message: str) -> str:
         branch_id = (
             session.get("pending_consultation_branch_id")
             or selected.get("branch_id")
-            or (selected.get("branches") or {}).get("id")
+            or (selected.get("branches", {}) or {}).get("id")
         )
 
         if not session.get("visitor_contact") and not session.get("client_id"):
@@ -787,7 +680,7 @@ def handle_message(session_id: str, user_message: str) -> str:
         branch_id = (
             session.get("pending_consultation_branch_id")
             or (selected.get("branch_id") if selected else None)
-            or ((selected.get("branches") or {}).get("id") if selected else None)
+            or ((selected.get("branches", {}) or {}).get("id") if selected else None)
         )
 
         if not selected or not service_id:
@@ -816,6 +709,57 @@ def handle_message(session_id: str, user_message: str) -> str:
         return booking["message"]
 
     # ─────────────────────────────────────────────────────────────────────────
+    # STAGE: USER PIVOTED TO A DIFFERENT SERVICE WHILE PICKING A SLOT
+    # ─────────────────────────────────────────────────────────────────────────
+    if stage == "awaiting_booking_switch_confirm":
+        new_service_id = session.get("pending_new_service_id")
+        new_service_name = session.get("pending_new_service_name", "the other service")
+        current_svc_name = session.get("last_service_name", "the current service")
+        original_pivot_message = session.get("pending_pivot_message", user_message)
+
+        yn = _interpret_yes_no(user_message)
+
+        if yn == "yes":
+            # Switch to the new service — clear old pending slots
+            update_session(session_id, {
+                "pending_slots": [],
+                "pending_new_service_id": None,
+                "pending_new_service_name": None,
+                "pending_pivot_message": None,
+                "pending_switch_from_stage": None,
+                "stage": "ready",
+            })
+            return handle_message(session_id, original_pivot_message)
+
+        elif yn == "no":
+            # Continue with original service's slot list
+            slots = session.get("pending_slots", [])
+            update_session(session_id, {
+                "pending_new_service_id": None,
+                "pending_new_service_name": None,
+                "pending_pivot_message": None,
+                "pending_switch_from_stage": None,
+                "stage": "awaiting_slot_selection",
+            })
+            slot_text = _format_slots(slots)
+            context = (
+                f"User wants to continue booking {current_svc_name}. "
+                f"Re-show these slots and ask which one works:\n\n{slot_text}"
+            )
+            response = _generate_response(context, user_message, history)
+            add_turn(session_id, user_message, response)
+            return response
+
+        else:
+            context = (
+                f"User gave an unclear response. Ask them clearly: do they want to switch "
+                f"to booking {new_service_name}, or continue picking a slot for {current_svc_name}?"
+            )
+            response = _generate_response(context, user_message, history)
+            add_turn(session_id, user_message, response)
+            return response
+
+    # ─────────────────────────────────────────────────────────────────────────
     # STAGE: USER SELECTING A REGULAR SERVICE SLOT
     # ─────────────────────────────────────────────────────────────────────────
     if stage == "awaiting_slot_selection":
@@ -823,13 +767,43 @@ def handle_message(session_id: str, user_message: str) -> str:
         choice = _parse_slot_choice(user_message, len(slots))
 
         if choice == -1:
+            # Check if the user is asking about a different service instead
+            possible_new_service_id = resolve_service_id(user_message)
+            current_service_id = session.get("last_service_id")
+            if possible_new_service_id and possible_new_service_id != current_service_id:
+                try:
+                    new_svc = supabase.table("services").select("name").eq(
+                        "id", possible_new_service_id
+                    ).single().execute().data
+                    new_svc_name = new_svc["name"]
+                except Exception:
+                    new_svc_name = "that service"
+
+                current_svc_name = session.get("last_service_name", "the current service")
+                update_session(session_id, {
+                    "pending_new_service_id": possible_new_service_id,
+                    "pending_new_service_name": new_svc_name,
+                    "pending_pivot_message": user_message,
+                    "pending_switch_from_stage": "awaiting_slot_selection",
+                    "stage": "awaiting_booking_switch_confirm",
+                })
+                context = (
+                    f"The user was choosing a slot for {current_svc_name} but just asked "
+                    f"about {new_svc_name} instead. Ask them warmly whether they'd like to "
+                    f"switch to booking {new_svc_name}, or continue picking a slot for "
+                    f"{current_svc_name}."
+                )
+                response = _generate_response(context, user_message, history)
+                add_turn(session_id, user_message, response)
+                return response
+
             context = f"User gave an invalid slot choice. There are {len(slots)} options numbered 1 to {len(slots)}. Ask them again naturally."
-            response = _generate_response(context, user_message, history, name)
+            response = _generate_response(context, user_message, history)
             add_turn(session_id, user_message, response)
             return response
         if choice is None:
             context = f"User gave an out-of-range slot choice. There are {len(slots)} options numbered 1 to {len(slots)}. Ask them again naturally."
-            response = _generate_response(context, user_message, history, name)
+            response = _generate_response(context, user_message, history)
             add_turn(session_id, user_message, response)
             return response
 
@@ -839,7 +813,7 @@ def handle_message(session_id: str, user_message: str) -> str:
         branch_id = (
             session.get("last_branch_id")
             or selected.get("branch_id")
-            or (selected.get("branches") or {}).get("id")
+            or (selected.get("branches", {}) or {}).get("id")
         )
 
         try:
@@ -881,7 +855,7 @@ def handle_message(session_id: str, user_message: str) -> str:
             f"Price: AED {svc['price_aed']:.0f}\n\n"
             "Present this summary naturally and ask if they'd like to confirm."
         )
-        response = _generate_response(context, user_message, history, name)
+        response = _generate_response(context, user_message, history)
         add_turn(session_id, user_message, response)
         return response
 
@@ -936,7 +910,7 @@ def handle_message(session_id: str, user_message: str) -> str:
         else:
             svc = session.get("pending_service", {})
             context = f"User gave an unclear response. Ask them again whether they want to confirm the {svc.get('name', 'booking')} — keep it natural."
-            response = _generate_response(context, user_message, history, name)
+            response = _generate_response(context, user_message, history)
             add_turn(session_id, user_message, response)
             return response
 
@@ -1019,7 +993,7 @@ def handle_message(session_id: str, user_message: str) -> str:
                 "This is a new visitor. Welcome them warmly and introduce Luma. "
                 "Then ask for their name to get started."
             )
-        response = _generate_response(greeting_context, user_message, history, name)
+        response = _generate_response(greeting_context, user_message, history)
         if not name:
             update_session(session_id, {"stage": "collect_name"})
         add_turn(session_id, user_message, response)
@@ -1028,7 +1002,7 @@ def handle_message(session_id: str, user_message: str) -> str:
     # ── FAQ ───────────────────────────────────────────────────────────────────
     if intent == "faq_general":
         result = lookup_faq(user_message)
-        response = _generate_response(result["answer"], user_message, history, name)
+        response = _generate_response(result["answer"], user_message, history)
         add_turn(session_id, user_message, response)
         return response
 
@@ -1044,6 +1018,7 @@ def handle_message(session_id: str, user_message: str) -> str:
         service_name_raw = entities.get("service", "")
         service_id = resolve_service_id(service_name_raw) if service_name_raw else None
 
+        # Fall back to last known service
         if not service_id:
             service_id = session.get("last_service_id")
             service_name_raw = session.get("last_service_name", "")
@@ -1055,7 +1030,7 @@ def handle_message(session_id: str, user_message: str) -> str:
                 "If they mentioned something we don't offer like a haircut, "
                 "acknowledge it and explain what we do specialise in."
             )
-            response = _generate_response(context, user_message, history, name)
+            response = _generate_response(context, user_message, history)
             add_turn(session_id, user_message, response)
             return response
 
@@ -1093,7 +1068,6 @@ def handle_message(session_id: str, user_message: str) -> str:
                 entities=entities,
                 user_message=user_message,
                 history=history,
-                visitor_name=name,
             )
 
         elif gate["status"] in ("NEEDS_CONSULTATION", "CLEARANCE_EXPIRED"):
@@ -1102,7 +1076,7 @@ def handle_message(session_id: str, user_message: str) -> str:
                 "pending_consultation_branch_id": session.get("last_branch_id"),
                 "stage": "awaiting_consultation_confirm",
             })
-            response = _generate_response(gate["message"], user_message, history, name)
+            response = _generate_response(gate["message"], user_message, history)
 
         elif gate["status"] == "NEEDS_SCREENING":
             if _is_yes(user_message) or intent == "create_booking":
@@ -1118,18 +1092,18 @@ def handle_message(session_id: str, user_message: str) -> str:
                     f"Question 1 of {len(SCREENING_QUESTIONS)}: {first_q['question']}"
                 )
             else:
-                response = _generate_response(gate["message"], user_message, history, name)
+                response = _generate_response(gate["message"], user_message, history)
 
         elif gate["status"] == "SCREENING_PENDING":
-            response = _generate_response(gate["message"], user_message, history, name)
+            response = _generate_response(gate["message"], user_message, history)
 
         elif gate["status"] == "HARD_BLOCK":
-            response = _generate_response(gate["message"], user_message, history, name)
+            response = _generate_response(gate["message"], user_message, history)
 
         else:
             response = _generate_response(
                 "Unable to check service requirements right now. Please call the branch directly.",
-                user_message, history, name,
+                user_message, history,
             )
 
         add_turn(session_id, user_message, response)
@@ -1163,7 +1137,7 @@ def handle_message(session_id: str, user_message: str) -> str:
         response = _book_consultation_slots(
             session_id, service_id, branch_id,
             session.get("last_service_name", service_name_raw.title() if service_name_raw else "this service"),
-            user_message, history, name,
+            user_message, history,
         )
         add_turn(session_id, user_message, response)
         return response
@@ -1182,7 +1156,7 @@ def handle_message(session_id: str, user_message: str) -> str:
         elif service_id:
             gate = check_service_gate(service_id, client_id)
             msg = gate.get("message") or f"Your clearance for {service_name_raw} is valid — you're good to book."
-            response = _generate_response(msg, user_message, history, name)
+            response = _generate_response(msg, user_message, history)
         else:
             response = "Which service's clearance would you like to check? (e.g. brow SPMU, lip filler)"
         add_turn(session_id, user_message, response)
@@ -1203,11 +1177,11 @@ def handle_message(session_id: str, user_message: str) -> str:
             if service_id:
                 gate = check_service_gate(service_id, client_id)
                 if gate["status"] == "HARD_BLOCK":
-                    response = _generate_response(gate["message"], user_message, history, name)
+                    response = _generate_response(gate["message"], user_message, history)
                 else:
                     response = _generate_response(
                         f"You can rebook {service_name_raw} — no frequency block is active on your account.",
-                        user_message, history, name,
+                        user_message, history,
                     )
             else:
                 response = "Which service would you like to check the rebooking interval for?"
@@ -1228,7 +1202,7 @@ def handle_message(session_id: str, user_message: str) -> str:
                 response = _generate_response(
                     f"Client wants to modify booking {booking_ref}. "
                     "Direct them to call the branch or connect them with the team.",
-                    user_message, history, name,
+                    user_message, history,
                 )
             else:
                 response = "Which booking would you like to change? Please share your booking reference (e.g. BKG-2026-XXXX)."
@@ -1252,12 +1226,12 @@ def handle_message(session_id: str, user_message: str) -> str:
                     ).eq("id", booking_ref).eq("client_id", client_id).execute()
                     response = _generate_response(
                         f"Booking {booking_ref} has been cancelled successfully.",
-                        user_message, history, name,
+                        user_message, history,
                     )
                 except Exception:
                     response = _generate_response(
                         "Unable to cancel the booking right now. Please call the branch directly.",
-                        user_message, history, name,
+                        user_message, history,
                     )
             else:
                 response = "Which booking would you like to cancel? Please share the booking reference (e.g. BKG-2026-XXXX)."
@@ -1275,12 +1249,12 @@ def handle_message(session_id: str, user_message: str) -> str:
                 ).eq("id", booking_ref).execute()
                 response = _generate_response(
                     f"Note added to booking {booking_ref}: '{notes_text}'.",
-                    user_message, history, name,
+                    user_message, history,
                 )
             except Exception:
                 response = _generate_response(
                     "I wasn't able to add the note right now. Please call the branch and they'll add it for you.",
-                    user_message, history, name,
+                    user_message, history,
                 )
         else:
             response = "Which booking would you like to add a note to? Please share the booking reference and your note."
@@ -1305,18 +1279,18 @@ def handle_message(session_id: str, user_message: str) -> str:
                         f"Payment link for {booking_ref}:\n"
                         f"Amount: AED {bk['deposit_amount_aed']:.0f}\n"
                         f"Link: {bk['payment_link']}\n(Valid for 24 hours)",
-                        user_message, history, name,
+                        user_message, history,
                     )
                 else:
                     response = _generate_response(
                         f"No payment link found for {booking_ref}. "
                         "This booking may already be paid, or doesn't require payment.",
-                        user_message, history, name,
+                        user_message, history,
                     )
             except Exception:
                 response = _generate_response(
                     "Unable to retrieve the payment link right now. Please call the branch directly.",
-                    user_message, history, name,
+                    user_message, history,
                 )
         else:
             response = "Which booking would you like the payment link for? Please share your booking reference (e.g. BKG-2026-XXXX)."
@@ -1326,13 +1300,13 @@ def handle_message(session_id: str, user_message: str) -> str:
     # ── Fallback ───────────────────────────────────────────────────────────────
     faq_result = lookup_faq(user_message)
     if faq_result["status"] == "FOUND":
-        response = _generate_response(faq_result["answer"], user_message, history, name)
+        response = _generate_response(faq_result["answer"], user_message, history)
     else:
         response = _generate_response(
             "I'm not sure how to help with that. "
             "I can help you book an appointment, check availability, "
             "answer questions about our services, or connect you with the team.",
-            user_message, history, name,
+            user_message, history,
         )
 
     # ── Post-turn: ask for name/contact if deferred ────────────────────────────
