@@ -718,8 +718,10 @@ def handle_message(session_id: str, user_message: str) -> str:
             svc = {"name": service_name, "price_aed": 0, "service_tier": "T1"}
 
         try:
+            DUBAI_TZ = timezone(timedelta(hours=4))
             dt = datetime.fromisoformat(selected["start_time"].replace("Z", "+00:00"))
-            formatted_time = dt.strftime("%A, %d %B at %I:%M %p")
+            dt_dubai = dt.astimezone(DUBAI_TZ)
+            formatted_time = dt_dubai.strftime("%A, %d %B at %I:%M %p")
         except Exception:
             formatted_time = selected.get("start_time", "")[:16]
 

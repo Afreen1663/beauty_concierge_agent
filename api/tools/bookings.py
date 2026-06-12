@@ -13,7 +13,7 @@ import os
 import random
 import string
 import stripe
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from api.database import supabase
 
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "")
@@ -271,8 +271,10 @@ def create_booking(
 
     # ── 7. Format confirmation message ────────────────────────────────────────
     try:
+        DUBAI_TZ = timezone(timedelta(hours=4))
         start_dt = datetime.fromisoformat(slot["start_time"].replace("Z", "+00:00"))
-        formatted_time = start_dt.strftime("%A, %d %B · %I:%M %p")
+        start_dt_dubai = start_dt.astimezone(DUBAI_TZ)
+        formatted_time = start_dt_dubai.strftime("%A, %d %B · %I:%M %p")
     except Exception:
         formatted_time = slot.get("start_time", "")[:16]
 
